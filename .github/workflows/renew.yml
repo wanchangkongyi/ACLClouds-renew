@@ -3,11 +3,10 @@ on:
   schedule:
     - cron: '5 2 * * *'
   workflow_dispatch:
-
 jobs:
   renew-job:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -17,20 +16,34 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Cache Playwright
+      - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}
 
+      # 仅在使用 NODE_LINK 代理功能时才需要缓存 sing-box 二进制，
+      # 未使用该功能可删掉这个 step，不影响脚本运行
+      - name: Cache sing-box binary
+        uses: actions/cache@v4
+        with:
+          path: ./sing-box
+          key: sing-box-${{ runner.os }}
+
       - name: Install dependencies
         run: |
-          pip install playwright
-          playwright install chromium
+          pip install playwright requests
+          playwright install --with-deps chromium
 
       - name: Run Renew Script
         env:
           ACL_COOKIES: ${{ secrets.ACL_COOKIES }}
+          # 以下为可选：只有需要走自建/外部代理时才需要配置对应 secret
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+          IS_PROXY: ${{ secrets.IS_PROXY }}
+          PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
+          PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
+          PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
         run: python renew.py
 
       - name: Keep Repo Active
