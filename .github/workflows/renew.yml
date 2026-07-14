@@ -9,6 +9,9 @@ jobs:
   renew:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      actions: write
+      contents: read
     steps:
       - uses: actions/checkout@v6
 
@@ -36,3 +39,18 @@ jobs:
           path: sing-box.log
           retention-days: 3
           if-no-files-found: ignore
+
+      - name: 清理旧的工作流运行记录
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          count=0
+          for run_id in $runs; do
+            count=$((count + 1))
+            if [ $count -gt 1 ]; then
+              echo "删除运行记录: $run_id"
+              gh run delete $run_id || true
+            fi
+          done
