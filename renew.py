@@ -3,7 +3,6 @@ import re
 import sys
 import json
 import time
-import atexit
 import base64
 import platform
 import subprocess
@@ -15,50 +14,19 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 SING_BOX_FALLBACK_VERSION = "1.13.14"
 SOCKS_PORT = 1080
+HTTP_PORT = 1081
 SING_BOX_BIN = "./sing-box"
 SING_BOX_CONFIG = "sing-box-config.json"
 SING_BOX_LOG = "sing-box.log"
-
-# 可通过环境变量调整（默认值与原脚本一致）
-HYSTERIA2_UP_MBPS = int(os.environ.get("HYSTERIA2_UP_MBPS", "100"))
-HYSTERIA2_DOWN_MBPS = int(os.environ.get("HYSTERIA2_DOWN_MBPS", "100"))
-
-# 全局引用，供 atexit 清理使用
-_SING_BOX_PROC = None
 
 
 def log(msg):
     print(f"[INFO] {msg}")
 
 
-def warn(msg):
-    print(f"[WARN] {msg}")
-
-
-def err(msg):
-    print(f"[ERROR] {msg}")
-
-
-def redact(value, keep=4):
-    """日志脱敏：只保留前后各 keep 个字符，中间打码"""
-    if not value:
-        return value
-    value = str(value)
-    if len(value) <= keep * 2:
-        return "*" * len(value)
-    return f"{value[:keep]}{'*' * (len(value) - keep * 2)}{value[-keep:]}"
-
-
 def parse_expires_minutes(text):
-    """
-    解析"剩余时间"文本，返回分钟数。
-    找不到任何时间信息时返回 None（而不是 0），
-    避免把"解析失败"误判为"时间已耗尽"从而触发不必要的续期。
-    """
     hours = re.search(r'(\d+)\s*h', text)
     mins = re.search(r'(\d+)\s*min', text)
-    if not hours and not mins:
-        return None
     total = 0
     if hours:
         total += int(hours.group(1)) * 60
@@ -188,8 +156,8 @@ def _parse_hysteria2(link):
         "server": u.hostname,
         "server_port": u.port or 443,
         "password": u.username or qs.get("auth", [""])[0],
-        "up_mbps": HYSTERIA2_UP_MBPS,
-        "down_mbps": HYSTERIA2_DOWN_MBPS,
+        "up_mbps": 100,
+        "down_mbps": 100,
         "tls": {
             "enabled": True,
             "server_name": qs.get("sni", [u.hostname])[0],
@@ -259,14 +227,11 @@ def _parse_socks5(link):
         username, password = u.username, (u.password or "")
         if not u.password:
             try:
-                padded = u.username + "=" * (-len(u.username) % 4)
-                decoded = base64.b64decode(padded).decode()
+                decoded = base64.b64decode(u.username + "=" * (-len(u.username) % 4)).decode()
                 if ":" in decoded:
                     username, password = decoded.split(":", 1)
-            except (base64.binascii.Error, UnicodeDecodeError, ValueError) as e:
-                # 明确只吞掉"不是 base64 / 解码不出文本"这类预期内错误，
-                # 其他异常继续抛出，避免掩盖真实 bug。
-                warn(f"socks5 用户名不是 base64 编码的 user:pass，按原始用户名使用: {e}")
+            except Exception:
+                pass
         outbound["username"] = username
         outbound["password"] = password
     return outbound
@@ -328,7 +293,7 @@ def ensure_sing_box_binary():
         if releases:
             version = releases[0]["tag_name"].lstrip("v")
     except Exception as e:
-        warn(f"获取最新版本失败，使用兜底版本 v{version}: {e}")
+        log(f"获取最新版本失败，使用兜底版本 v{version}: {e}")
 
     filename = f"sing-box-{version}-linux-{arch}.tar.gz"
     url = f"https://github.com/SagerNet/sing-box/releases/download/v{version}/{filename}"
@@ -353,11 +318,11 @@ def ensure_sing_box_binary():
 
 
 def write_config(outbound):
-    # 只保留 SOCKS 入站；原脚本额外起了一个从未被使用的 HTTP(1081) 入站，属冗余，已移除。
     config = {
         "log": {"level": "warn"},
         "inbounds": [
             {"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": SOCKS_PORT},
+            {"type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": HTTP_PORT},
         ],
         "outbounds": [outbound],
     }
@@ -365,44 +330,16 @@ def write_config(outbound):
         json.dump(config, f)
 
 
-def _cleanup_sing_box():
-    global _SING_BOX_PROC
-    if _SING_BOX_PROC and _SING_BOX_PROC.poll() is None:
-        log("清理 sing-box 进程...")
-        _SING_BOX_PROC.terminate()
-        try:
-            _SING_BOX_PROC.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            _SING_BOX_PROC.kill()
-    _SING_BOX_PROC = None
-
-
-atexit.register(_cleanup_sing_box)
-
-
-def start_sing_box(startup_timeout=8, poll_interval=0.5):
-    """
-    启动 sing-box 并轮询其存活状态，而不是固定 sleep 后一次性判断，
-    这样对启动较慢的情况更宽容，对启动后很快挂掉的情况响应更及时。
-    """
-    global _SING_BOX_PROC
+def start_sing_box():
     log_file = open(SING_BOX_LOG, "w")
     proc = subprocess.Popen(
         [SING_BOX_BIN, "run", "-c", SING_BOX_CONFIG],
         stdout=log_file, stderr=subprocess.STDOUT,
     )
-    _SING_BOX_PROC = proc
-
-    waited = 0.0
-    while waited < startup_timeout:
-        if proc.poll() is not None:
-            with open(SING_BOX_LOG) as f:
-                content = f.read()
-            _SING_BOX_PROC = None
-            raise RuntimeError(f"sing-box 启动后立即退出，日志:\n{content}")
-        time.sleep(poll_interval)
-        waited += poll_interval
-
+    time.sleep(5)
+    if proc.poll() is not None:
+        with open(SING_BOX_LOG) as f:
+            raise RuntimeError(f"sing-box 启动后立即退出，日志:\n{f.read()}")
     return proc
 
 
@@ -418,7 +355,7 @@ def test_proxy_connectivity():
             log(f"代理连接成功，出口 IP: {r.text.strip()}")
             return True
         except Exception as e:
-            warn(f"代理测试第 {attempt}/3 次失败: {e}")
+            log(f"代理测试第 {attempt}/3 次失败: {e}")
             time.sleep(3)
     return False
 
@@ -427,13 +364,13 @@ def setup_proxy_from_node_link(node_link):
     try:
         outbound = parse_node_link(node_link)
     except Exception as e:
-        err(f"节点链接解析失败: {e}")
+        log(f"❌ 节点链接解析失败: {e}")
         return None
 
     try:
         ensure_sing_box_binary()
     except Exception as e:
-        err(f"sing-box 准备失败: {e}")
+        log(f"❌ sing-box 准备失败: {e}")
         return None
 
     write_config(outbound)
@@ -441,13 +378,12 @@ def setup_proxy_from_node_link(node_link):
     try:
         proc = start_sing_box()
     except Exception as e:
-        err(str(e))
-        _cleanup_sing_box()
+        log(f"❌ {e}")
         return None
 
     if not test_proxy_connectivity():
-        err("代理连通性测试失败（能连上 sing-box，但出口网络不通，注意目标站点可能对该出口 IP 有额外限制）")
-        _cleanup_sing_box()
+        log("❌ 代理连通性测试失败")
+        proc.terminate()
         return None
 
     return {"server": f"socks5://127.0.0.1:{SOCKS_PORT}"}
@@ -460,7 +396,7 @@ def build_proxy_config():
         proxy_config = setup_proxy_from_node_link(node_link)
         if proxy_config:
             return proxy_config
-        warn("基于 NODE_LINK 启动代理失败，回退为直连")
+        log("⚠️ 基于 NODE_LINK 启动代理失败，回退为直连")
         return None
 
     is_proxy = os.environ.get("IS_PROXY", "false").strip().lower() == "true"
@@ -470,7 +406,7 @@ def build_proxy_config():
 
     proxy_server = os.environ.get("PROXY_SERVER", "").strip()
     if not proxy_server:
-        warn("IS_PROXY=true 但未设置 PROXY_SERVER，回退为直连")
+        log("⚠️ IS_PROXY=true 但未设置 PROXY_SERVER，回退为直连")
         return None
 
     proxy_config = {"server": proxy_server}
@@ -478,9 +414,7 @@ def build_proxy_config():
     if username:
         proxy_config["username"] = username
         proxy_config["password"] = os.environ.get("PROXY_PASSWORD", "").strip()
-        log(f"使用外部已启动的代理: {proxy_server}（用户名: {redact(username)}）")
-    else:
-        log(f"使用外部已启动的代理: {proxy_server}")
+    log(f"使用外部已启动的代理: {proxy_server}")
     return proxy_config
 
 
@@ -494,7 +428,7 @@ def run(playwright):
     try:
         browser = playwright.chromium.launch(**launch_kwargs)
     except Exception as e:
-        err(f"浏览器启动失败: {e}")
+        log(f"❌ 浏览器启动失败: {e}")
         return
 
     context = browser.new_context(
@@ -504,26 +438,21 @@ def run(playwright):
 
     raw_cookies = os.environ.get('ACL_COOKIES', '')
     if not raw_cookies:
-        err("未找到 ACL_COOKIES 环境变量")
+        log("错误: 未找到 ACL_COOKIES 环境变量")
         browser.close()
         return
 
     cookies = []
-    cookie_names = []
     for item in raw_cookies.split(';'):
         if '=' in item:
             name, value = item.split('=', 1)
-            name = name.strip()
             cookies.append({
-                "name": name,
+                "name": name.strip(),
                 "value": value.strip(),
                 "domain": "dash.aclclouds.com",
                 "path": "/"
             })
-            cookie_names.append(name)
     context.add_cookies(cookies)
-    # 只打印 Cookie 名称，不打印值，避免会话凭证泄露到日志
-    log(f"已注入 {len(cookies)} 个 Cookie: {', '.join(cookie_names) if cookie_names else '(无)'}")
     page = context.new_page()
 
     try:
@@ -544,12 +473,12 @@ def run(playwright):
             else:
                 log("无暂停服务器")
         except PlaywrightTimeout:
-            warn("激活操作超时，跳过本步骤（可能页面结构变化或网络较慢）")
+            log("激活操作超时")
 
         try:
             page.wait_for_selector('a[href*="/server/"]', timeout=10000)
         except PlaywrightTimeout:
-            warn("等待服务器链接超时，尝试继续...")
+            log("等待服务器链接超时，尝试继续...")
 
         server_links = page.locator('a[href*="/server/"]').all()
         hrefs = []
@@ -560,7 +489,7 @@ def run(playwright):
         log(f"找到 {len(hrefs)} 个服务器")
 
         if len(hrefs) == 0:
-            err("未找到任何服务器，Cookie 可能已过期，请更新")
+            log("未找到任何服务器，Cookie 可能已过期，请更新")
             browser.close()
             return
 
@@ -588,15 +517,13 @@ def run(playwright):
                 temps_el = page.locator('text=/Temps restant/').first
                 full_text = temps_el.inner_text(timeout=5000)
                 remaining = parse_expires_minutes(full_text)
-                if remaining is not None:
-                    log(f"剩余时间: {full_text.strip()} ({remaining} 分钟)")
-                else:
-                    warn(f"读取到剩余时间文本但无法解析格式: '{full_text.strip()}'，按未知处理，跳过续期判断")
+                log(f"剩余时间: {full_text.strip()} ({remaining} 分钟)")
             except Exception as e:
-                warn(f"无法读取剩余时间: {e}")
+                log(f"无法读取剩余时间: {e}")
 
-            if remaining is not None and remaining <= 150:
-                log("剩余时间不足2.5h，尝试续期...")
+            RENEW_THRESHOLD_MINUTES = 2 * 24 * 60 - 30  # 到期前2天可续期，留30分钟余量 = 2850分钟
+            if remaining is not None and remaining <= RENEW_THRESHOLD_MINUTES:
+                log(f"剩余时间不足 2 天（阈值 {RENEW_THRESHOLD_MINUTES} 分钟），尝试续期...")
                 try:
                     renew_btn = page.locator('button:has-text("Renouveler")').first
                     if renew_btn.is_visible(timeout=3000):
@@ -610,7 +537,7 @@ def run(playwright):
                     else:
                         log("续期按钮不可见，未到续期窗口期")
                 except PlaywrightTimeout:
-                    warn("续期操作超时")
+                    log("续期操作超时")
             elif remaining is None:
                 log("无法读取剩余时间，跳过续期")
             else:
@@ -627,15 +554,14 @@ def run(playwright):
                 else:
                     log("服务器已在运行")
             except PlaywrightTimeout:
-                warn("开机操作超时")
+                log("开机操作超时")
 
         log("全部服务器处理完成")
 
     except Exception as e:
-        err(f"执行过程中发生错误: {e}")
+        log(f"执行过程中发生错误: {e}")
     finally:
         browser.close()
-        _cleanup_sing_box()
 
 
 with sync_playwright() as playwright:
