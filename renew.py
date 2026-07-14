@@ -310,7 +310,7 @@ def ensure_sing_box_binary():
     with tarfile.open(filename) as tf:
         member = next(m for m in tf.getmembers() if m.name.endswith("/sing-box"))
         member.name = os.path.basename(member.name)
-        tf.extract(member, path=".")
+        tf.extract(member, path=".", filter="data")
 
     os.remove(filename)
     os.chmod(SING_BOX_BIN, 0o755)
