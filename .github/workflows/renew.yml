@@ -1,56 +1,38 @@
-name: ACLClouds Auto Renew
+name: ACL Clouds Auto Renew
+
 on:
   schedule:
-    - cron: '5 2 * * *'
+    - cron: '0 3 * * *'  # 每天 UTC 3点跑一次，配合脚本里"到期前2天可续期"的窗口，留出充足重试余量
   workflow_dispatch:
+
 jobs:
-  renew-job:
+  renew:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: 设置 Python
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.10'
+          python-version: '3.12'
 
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}
-
-      # 仅在使用 NODE_LINK 代理功能时才需要缓存 sing-box 二进制，
-      # 未使用该功能可删掉这个 step，不影响脚本运行
-      - name: Cache sing-box binary
-        uses: actions/cache@v4
-        with:
-          path: ./sing-box
-          key: sing-box-${{ runner.os }}
-
-      - name: Install dependencies
+      - name: 安装依赖
         run: |
-          pip install playwright requests
+          pip install -r requirements.txt
           playwright install --with-deps chromium
 
-      - name: Run Renew Script
+      - name: 运行续期脚本
         env:
           ACL_COOKIES: ${{ secrets.ACL_COOKIES }}
-          # 以下为可选：只有需要走自建/外部代理时才需要配置对应 secret
           NODE_LINK: ${{ secrets.NODE_LINK }}
-          IS_PROXY: ${{ secrets.IS_PROXY }}
-          PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
-          PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
-          PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
         run: python renew.py
 
-      - name: Keep Repo Active
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          echo "Last run: $(date '+%Y-%m-%d %H:%M:%S')" > keep_alive.txt
-          git add keep_alive.txt
-          git diff --staged --quiet || git commit -m "chore: keep alive $(date '+%Y-%m-%d')"
-          git push
+      - name: 上传 sing-box 日志（失败排查用）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-log
+          path: sing-box.log
+          retention-days: 3
+          if-no-files-found: ignore
