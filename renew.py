@@ -25,9 +25,12 @@ def log(msg):
 
 
 def parse_expires_minutes(text):
-    hours = re.search(r'(\d+)\s*h', text)
+    days = re.search(r'(\d+)\s*d\b', text)
+    hours = re.search(r'(\d+)\s*h\b', text)
     mins = re.search(r'(\d+)\s*min', text)
     total = 0
+    if days:
+        total += int(days.group(1)) * 24 * 60
     if hours:
         total += int(hours.group(1)) * 60
     if mins:
@@ -418,6 +421,24 @@ def build_proxy_config():
     return proxy_config
 
 
+def find_first_visible(page, texts, timeout_ms=6000, poll_interval_ms=300):
+    """
+    按顺序尝试多个候选文案（应对页面语言不固定，比如中/英/法切换），
+    轮询到 timeout_ms 为止，谁先可见就返回谁的 locator，全部找不到返回 None。
+    """
+    deadline = time.time() + timeout_ms / 1000
+    while time.time() < deadline:
+        for t in texts:
+            loc = page.get_by_text(t, exact=True).first
+            try:
+                if loc.is_visible(timeout=200):
+                    return loc
+            except Exception:
+                continue
+        page.wait_for_timeout(poll_interval_ms)
+    return None
+
+
 def dump_debug(page, tag):
     """失败时留证据：存一张截图，并把页面正文前 500 字打到日志里，方便对照实际文案/选择器"""
     try:
@@ -484,15 +505,12 @@ def run(playwright):
         log(f"当前标题: {current_title}")
 
         try:
-            reactiver_btns = page.locator('button:has-text("Réactiver")')
-            count = reactiver_btns.count()
-            if count > 0:
-                log(f"检测到 {count} 个暂停的服务器，点击重新激活...")
-                for i in range(count):
-                    reactiver_btns.nth(i).click()
-                    page.wait_for_timeout(3000)
-                    log(f"第 {i+1} 个服务器已激活")
+            reactiver_btn = find_first_visible(page, ["Reactivate", "Réactiver", "重新激活"], timeout_ms=3000)
+            if reactiver_btn:
+                log("检测到暂停的服务器，点击重新激活...")
+                reactiver_btn.click()
                 page.wait_for_timeout(3000)
+                log("已激活")
             else:
                 log("无暂停服务器")
         except PlaywrightTimeout:
@@ -516,7 +534,6 @@ def run(playwright):
             shot_path = "screenshots/no_servers_found.png"
             page.screenshot(path=shot_path, full_page=True)
 
-            # 用 URL / 标题辅助判断具体原因，而不是笼统地都归为 "Cookie 过期"
             url_lower = current_url.lower()
             title_lower = (current_title or "").lower()
             if "login" in url_lower or "signin" in url_lower or "login" in title_lower:
@@ -538,22 +555,20 @@ def run(playwright):
             page.goto(url, timeout=60000)
             page.wait_for_timeout(5000)
 
-            try:
-                suspended_btn = page.locator('button:has-text("Renouveler maintenant")')
-                if suspended_btn.is_visible(timeout=3000):
-                    log("服务器被暂停，点击立即续期...")
-                    suspended_btn.click()
-                    page.wait_for_timeout(5000)
-                    log("暂停续期完成")
-                    page.goto(url, timeout=60000)
-                    page.wait_for_timeout(5000)
-            except PlaywrightTimeout:
-                pass
+            suspended_btn = find_first_visible(page, ["Renew now", "Renouveler maintenant", "立即续期"], timeout_ms=3000)
+            if suspended_btn:
+                log("服务器被暂停，点击立即续期...")
+                suspended_btn.click()
+                page.wait_for_timeout(5000)
+                log("暂停续期完成")
+                page.goto(url, timeout=60000)
+                page.wait_for_timeout(5000)
 
             remaining = None
             try:
-                temps_el = page.locator('text=/Temps restant/').first
-                full_text = temps_el.inner_text(timeout=5000)
+                # 用正则同时匹配中/英/法几种可能的措辞，谁匹配上用谁
+                temps_el = page.locator('text=/Time remaining|Temps restant|剩余时间/').first
+                full_text = temps_el.inner_text(timeout=6000)
                 remaining = parse_expires_minutes(full_text)
                 log(f"剩余时间: {full_text.strip()} ({remaining} 分钟)")
             except Exception as e:
@@ -563,38 +578,35 @@ def run(playwright):
             RENEW_THRESHOLD_MINUTES = 2 * 24 * 60 - 30  # 到期前2天可续期，留30分钟余量 = 2850分钟
             if remaining is not None and remaining <= RENEW_THRESHOLD_MINUTES:
                 log(f"剩余时间不足 2 天（阈值 {RENEW_THRESHOLD_MINUTES} 分钟），尝试续期...")
-                try:
-                    renew_btn = page.locator('button:has-text("Renouveler")').first
-                    if renew_btn.is_visible(timeout=3000):
-                        renew_btn.click()
+                renew_btn = find_first_visible(page, ["Renew", "Renouveler", "续期"], timeout_ms=3000)
+                if renew_btn:
+                    renew_btn.click()
+                    page.wait_for_timeout(2000)
+                    confirm_btn = find_first_visible(page, ["Confirm", "Confirmer", "确认"], timeout_ms=3000)
+                    if confirm_btn:
+                        confirm_btn.click()
                         page.wait_for_timeout(2000)
-                        confirm = page.locator('button:has-text("Confirmer")')
-                        if confirm.is_visible(timeout=3000):
-                            confirm.click()
-                            page.wait_for_timeout(2000)
-                        log("续期成功")
-                    else:
-                        log("续期按钮不可见，未到续期窗口期")
-                except PlaywrightTimeout:
-                    log("续期操作超时")
+                    log("续期成功")
+                else:
+                    log("续期按钮不可见，未到续期窗口期")
+                    dump_debug(page, f"server_{idx+1}_renew_button_missing")
             elif remaining is None:
                 log("无法读取剩余时间，跳过续期")
             else:
                 log(f"剩余时间充足（{remaining}min），无需续期")
 
-            try:
-                start_btn = page.locator('button:has-text("Start")').first
-                if start_btn.is_visible(timeout=5000):
-                    start_btn.scroll_into_view_if_needed()
-                    page.wait_for_timeout(1000)
-                    start_btn.click()
-                    log("开机成功")
-                    page.wait_for_timeout(3000)
-                else:
-                    log("服务器已在运行")
-            except PlaywrightTimeout:
-                log("开机操作超时")
-                dump_debug(page, f"server_{idx+1}_start_timeout")
+            # 截图证实 Start/Restart/Stop 三个按钮在各种状态下都常驻显示，
+            # 不再靠猜状态文字决定是否跳过，始终尝试点，点不到再具体分析原因
+            start_btn = find_first_visible(page, ["Start", "Démarrer", "开机"], timeout_ms=6000)
+            if start_btn:
+                start_btn.scroll_into_view_if_needed()
+                page.wait_for_timeout(1000)
+                start_btn.click()
+                log("点击开机按钮完成（如服务器已在运行，此操作通常无副作用）")
+                page.wait_for_timeout(3000)
+            else:
+                log("未找到开机按钮")
+                dump_debug(page, f"server_{idx+1}_start_button_missing")
 
         log("全部服务器处理完成")
 
