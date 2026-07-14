@@ -418,6 +418,24 @@ def build_proxy_config():
     return proxy_config
 
 
+def dump_debug(page, tag):
+    """失败时留证据：存一张截图，并把页面正文前 500 字打到日志里，方便对照实际文案/选择器"""
+    try:
+        os.makedirs("screenshots", exist_ok=True)
+        shot_path = f"screenshots/{tag}.png"
+        page.screenshot(path=shot_path, full_page=True)
+        log(f"📸 已保存诊断截图: {shot_path}")
+    except Exception as e:
+        log(f"⚠️ 截图失败: {e}")
+
+    try:
+        body_text = page.locator("body").inner_text(timeout=3000)
+        snippet = " ".join(body_text.split())[:500]
+        log(f"📄 页面正文片段: {snippet!r}")
+    except Exception as e:
+        log(f"⚠️ 读取页面正文失败: {e}")
+
+
 def run(playwright):
     proxy_config = build_proxy_config()
 
@@ -460,6 +478,11 @@ def run(playwright):
         page.goto("https://dash.aclclouds.com/projects", timeout=60000)
         page.wait_for_timeout(5000)
 
+        current_url = page.url
+        current_title = page.title()
+        log(f"当前 URL: {current_url}")
+        log(f"当前标题: {current_title}")
+
         try:
             reactiver_btns = page.locator('button:has-text("Réactiver")')
             count = reactiver_btns.count()
@@ -489,7 +512,22 @@ def run(playwright):
         log(f"找到 {len(hrefs)} 个服务器")
 
         if len(hrefs) == 0:
-            log("未找到任何服务器，Cookie 可能已过期，请更新")
+            os.makedirs("screenshots", exist_ok=True)
+            shot_path = "screenshots/no_servers_found.png"
+            page.screenshot(path=shot_path, full_page=True)
+
+            # 用 URL / 标题辅助判断具体原因，而不是笼统地都归为 "Cookie 过期"
+            url_lower = current_url.lower()
+            title_lower = (current_title or "").lower()
+            if "login" in url_lower or "signin" in url_lower or "login" in title_lower:
+                log("❌ 当前停留在登录页，说明 Cookie 无效/已过期（不是代理或反爬问题），请更新 ACL_COOKIES")
+            elif any(kw in title_lower for kw in ("just a moment", "attention required", "access denied", "blocked")):
+                log("❌ 页面标题显示疑似被反爬/风控拦截（很可能是代理出口 IP 被目标站点识别为数据中心/VPS IP），"
+                    "建议更换代理节点，或临时不设 NODE_LINK 走直连对比测试")
+            else:
+                log("❌ 既不在登录页也无明显拦截特征，但页面上没有服务器链接，"
+                    "请查看下方截图 Artifact 确认页面实际内容（可能是页面结构变了，选择器需要更新）")
+            log(f"截图已保存: {shot_path}")
             browser.close()
             return
 
@@ -498,7 +536,7 @@ def run(playwright):
             log(f"--- 处理第 {idx+1} 个服务器 ---")
 
             page.goto(url, timeout=60000)
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(5000)
 
             try:
                 suspended_btn = page.locator('button:has-text("Renouveler maintenant")')
@@ -508,7 +546,7 @@ def run(playwright):
                     page.wait_for_timeout(5000)
                     log("暂停续期完成")
                     page.goto(url, timeout=60000)
-                    page.wait_for_timeout(3000)
+                    page.wait_for_timeout(5000)
             except PlaywrightTimeout:
                 pass
 
@@ -520,6 +558,7 @@ def run(playwright):
                 log(f"剩余时间: {full_text.strip()} ({remaining} 分钟)")
             except Exception as e:
                 log(f"无法读取剩余时间: {e}")
+                dump_debug(page, f"server_{idx+1}_no_remaining_time")
 
             RENEW_THRESHOLD_MINUTES = 2 * 24 * 60 - 30  # 到期前2天可续期，留30分钟余量 = 2850分钟
             if remaining is not None and remaining <= RENEW_THRESHOLD_MINUTES:
@@ -555,6 +594,7 @@ def run(playwright):
                     log("服务器已在运行")
             except PlaywrightTimeout:
                 log("开机操作超时")
+                dump_debug(page, f"server_{idx+1}_start_timeout")
 
         log("全部服务器处理完成")
 
